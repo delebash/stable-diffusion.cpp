@@ -1165,13 +1165,17 @@ namespace LTXV {
             blocks["audio_ff"]            = std::make_shared<FeedForward>(a_dim, a_dim, 4, FeedForward::Activation::GELU, false, audio_ff_bias);
         }
 
+        // `index` (I32, one entry per token) is set when `timestep` holds only the distinct timesteps of a conditioned
+        // clip (see LTXAVRunner::build_graph): the table rows are then built per distinct timestep and gathered per token
+        // only for the chunks asked for, instead of [dim × coeff × tokens] for all of them.
         std::vector<ggml_tensor*> get_ada_values(GGMLRunnerContext* ctx,
                                                  ggml_tensor* table,
                                                  ggml_tensor* timestep,
                                                  int64_t dim,
                                                  int64_t coeff,
-                                                 int64_t start = 0,
-                                                 int64_t count = -1) {
+                                                 int64_t start      = 0,
+                                                 int64_t count      = -1,
+                                                 ggml_tensor* index = nullptr) {
             if (count < 0) {
                 count = coeff - start;
             }
@@ -1182,7 +1186,14 @@ namespace LTXV {
             s           = ggml_repeat(ctx->ggml_ctx, s, e);
             auto out    = ggml_add(ctx->ggml_ctx, s, t);
             auto chunks = ggml_ext_chunk(ctx->ggml_ctx, out, static_cast<int>(coeff), 1);
-            return std::vector<ggml_tensor*>(chunks.begin() + start, chunks.begin() + start + count);
+            std::vector<ggml_tensor*> picked(chunks.begin() + start, chunks.begin() + start + count);
+            if (index != nullptr) {
+                for (auto& c : picked) {
+                    auto rows = ggml_reshape_2d(ctx->ggml_ctx, ggml_cont(ctx->ggml_ctx, c), dim, timestep->ne[1]);
+                    c         = ggml_reshape_3d(ctx->ggml_ctx, ggml_get_rows(ctx->ggml_ctx, rows, index), dim, 1, index->ne[0]);
+                }
+            }
+            return picked;
         }
 
         ggml_tensor* apply_text_cross_attention(GGMLRunnerContext* ctx,
@@ -1194,9 +1205,10 @@ namespace LTXV {
                                                 ggml_tensor* timestep,
                                                 ggml_tensor* prompt_timestep,
                                                 int64_t dim,
-                                                ggml_tensor* attention_mask) {
+                                                ggml_tensor* attention_mask,
+                                                ggml_tensor* timestep_index = nullptr) {
             if (cross_attention_adaln) {
-                auto q_mods      = get_ada_values(ctx, table, timestep, dim, 9, 6, 3);
+                auto q_mods      = get_ada_values(ctx, table, timestep, dim, 9, 6, 3, timestep_index);
                 auto q           = rms_norm(ctx->ggml_ctx, x);
                 q                = LTXV::modulate(ctx->ggml_ctx, q, q_mods[0], q_mods[1]);
                 auto context_mod = context;
@@ -1230,7 +1242,8 @@ namespace LTXV {
                                                       ggml_tensor* a_cross_gate_timestep,
                                                       ggml_tensor* v_prompt_timestep,
                                                       ggml_tensor* a_prompt_timestep,
-                                                      ggml_tensor* self_attention_mask = nullptr) {
+                                                      ggml_tensor* self_attention_mask = nullptr,
+                                                      ggml_tensor* v_timestep_index    = nullptr) {
             auto attn1               = std::dynamic_pointer_cast<CrossAttention>(blocks["attn1"]);
             auto audio_attn1         = std::dynamic_pointer_cast<CrossAttention>(blocks["audio_attn1"]);
             auto attn2               = std::dynamic_pointer_cast<CrossAttention>(blocks["attn2"]);
@@ -1247,7 +1260,7 @@ namespace LTXV {
             bool run_a2v = run_ax;
             bool run_v2a = run_ax;
 
-            auto v_mods = get_ada_values(ctx, v_table, v_timestep, v_dim, cross_attention_adaln ? 9 : 6);
+            auto v_mods = get_ada_values(ctx, v_table, v_timestep, v_dim, cross_attention_adaln ? 9 : 6, 0, 3, v_timestep_index);
             auto v_norm = rms_norm(ctx->ggml_ctx, vx);
             v_norm      = LTXV::modulate(ctx->ggml_ctx, v_norm, v_mods[0], v_mods[1]);
             auto v_sa   = attn1->forward(ctx, v_norm, nullptr, self_attention_mask, v_pe);
@@ -1261,7 +1274,8 @@ namespace LTXV {
                                                      v_timestep,
                                                      v_prompt_timestep,
                                                      v_dim,
-                                                     attention_mask);
+                                                     attention_mask,
+                                                     v_timestep_index);
             vx          = ggml_add(ctx->ggml_ctx, vx, v_txt);
 
             if (run_ax) {
@@ -1317,7 +1331,7 @@ namespace LTXV {
                 ax             = ggml_add(ctx->ggml_ctx, ax, apply_gate(ctx->ggml_ctx, a_ff_out, a_ff_mods[2]));
             }
 
-            auto v_ff_mods = get_ada_values(ctx, v_table, v_timestep, v_dim, cross_attention_adaln ? 9 : 6, 3, 3);
+            auto v_ff_mods = get_ada_values(ctx, v_table, v_timestep, v_dim, cross_attention_adaln ? 9 : 6, 3, 3, v_timestep_index);
             auto vx_scaled = rms_norm(ctx->ggml_ctx, vx);
             vx_scaled      = LTXV::modulate(ctx->ggml_ctx, vx_scaled, v_ff_mods[0], v_ff_mods[1]);
             auto v_ff_out  = ff->forward(ctx, vx_scaled);
@@ -1598,12 +1612,20 @@ namespace LTXV {
         std::vector<ggml_tensor*> get_output_scale_shift(GGMLRunnerContext* ctx,
                                                          ggml_tensor* table,
                                                          ggml_tensor* embedded_timestep,
-                                                         int64_t dim) {
-            auto temp = ggml_new_tensor_3d(ctx->ggml_ctx, embedded_timestep->type, dim, 2, embedded_timestep->ne[1]);
-            auto t    = ggml_repeat(ctx->ggml_ctx, ggml_reshape_3d(ctx->ggml_ctx, embedded_timestep, dim, 1, embedded_timestep->ne[1]), temp);
-            auto s    = ggml_repeat(ctx->ggml_ctx, ggml_reshape_3d(ctx->ggml_ctx, table, dim, 2, 1), temp);
-            auto out  = ggml_add(ctx->ggml_ctx, s, t);
-            return ggml_ext_chunk(ctx->ggml_ctx, out, 2, 1);
+                                                         int64_t dim,
+                                                         ggml_tensor* index = nullptr) {
+            auto temp   = ggml_new_tensor_3d(ctx->ggml_ctx, embedded_timestep->type, dim, 2, embedded_timestep->ne[1]);
+            auto t      = ggml_repeat(ctx->ggml_ctx, ggml_reshape_3d(ctx->ggml_ctx, embedded_timestep, dim, 1, embedded_timestep->ne[1]), temp);
+            auto s      = ggml_repeat(ctx->ggml_ctx, ggml_reshape_3d(ctx->ggml_ctx, table, dim, 2, 1), temp);
+            auto out    = ggml_add(ctx->ggml_ctx, s, t);
+            auto chunks = ggml_ext_chunk(ctx->ggml_ctx, out, 2, 1);
+            if (index != nullptr) {  // per distinct timestep → per token (see get_ada_values)
+                for (auto& c : chunks) {
+                    auto rows = ggml_reshape_2d(ctx->ggml_ctx, ggml_cont(ctx->ggml_ctx, c), dim, embedded_timestep->ne[1]);
+                    c         = ggml_reshape_3d(ctx->ggml_ctx, ggml_get_rows(ctx->ggml_ctx, rows, index), dim, 1, index->ne[0]);
+                }
+            }
+            return chunks;
         }
 
         std::pair<ggml_tensor*, ggml_tensor*> forward(GGMLRunnerContext* ctx,
@@ -1617,7 +1639,8 @@ namespace LTXV {
                                                       ggml_tensor* v_cross_pe,
                                                       ggml_tensor* a_cross_pe,
                                                       ggml_tensor* video_connector_pe,
-                                                      ggml_tensor* audio_connector_pe) {
+                                                      ggml_tensor* audio_connector_pe,
+                                                      ggml_tensor* timestep_index = nullptr) {
             auto patchify_proj       = std::dynamic_pointer_cast<Linear>(blocks["patchify_proj"]);
             auto audio_patchify_proj = std::dynamic_pointer_cast<Linear>(blocks["audio_patchify_proj"]);
             auto adaln_single        = std::dynamic_pointer_cast<AdaLayerNormSingle>(blocks["adaln_single"]);
@@ -1672,7 +1695,11 @@ namespace LTXV {
                 a_prompt_timestep_mod          = audio_prompt_adaln_single->forward(ctx, a_timestep_scaled).first;
             }
 
-            auto av_ca_video_timestep = repeat_scalar_timestep_like(ctx, effective_audio_timestep, timestep);
+            // With distinct timesteps (`timestep_index`), the scalar audio timestep is the same for every video token: it
+            // broadcasts as is instead of being repeated to a row per token.
+            auto av_ca_video_timestep = timestep_index != nullptr && effective_audio_timestep->ne[0] == 1
+                                            ? effective_audio_timestep
+                                            : repeat_scalar_timestep_like(ctx, effective_audio_timestep, timestep);
             auto av_ca_audio_timestep = effective_audio_timestep;
             auto av_ca_factor         = config.av_ca_timestep_scale_multiplier / config.timestep_scale_multiplier;
             auto av_ca_video_scale_shift_timestep =
@@ -1710,14 +1737,16 @@ namespace LTXV {
                                             av_ca_a2v_gate_noise_timestep,
                                             av_ca_v2a_gate_noise_timestep,
                                             v_prompt_timestep_mod,
-                                            a_prompt_timestep_mod);
+                                            a_prompt_timestep_mod,
+                                            nullptr,
+                                            timestep_index);
                 vx         = out.first;
                 ax         = out.second;
                 sd::ggml_graph_cut::mark_graph_cut(vx, "ltxav.transformer_blocks." + std::to_string(i), "vx");
                 sd::ggml_graph_cut::mark_graph_cut(ax, "ltxav.transformer_blocks." + std::to_string(i), "ax");
             }
 
-            auto v_shift_scale = get_output_scale_shift(ctx, params["scale_shift_table"], v_embedded_time, config.hidden_size);
+            auto v_shift_scale = get_output_scale_shift(ctx, params["scale_shift_table"], v_embedded_time, config.hidden_size, timestep_index);
             vx                 = norm_out->forward(ctx, vx);
             vx                 = LTXV::modulate(ctx->ggml_ctx, vx, v_shift_scale[0], v_shift_scale[1]);
             vx                 = proj_out->forward(ctx, vx);
@@ -1746,6 +1775,8 @@ namespace LTXV {
         std::vector<float> audio_connector_pe_vec;
         sd::Tensor<float> vx_input_cache;
         sd::Tensor<float> ax_input_cache;
+        sd::Tensor<float> timesteps_distinct_cache;
+        sd::Tensor<int32_t> timestep_index_cache;
 
         LTXAVRunner(ggml_backend_t backend,
                     const String2TensorStorage& tensor_storage_map      = {},
@@ -1844,9 +1875,40 @@ namespace LTXV {
 
             ggml_tensor* vx         = make_input(vx_input_cache);
             ggml_tensor* ax         = make_optional_input(ax_input_cache);
-            ggml_tensor* timesteps  = make_input(timesteps_tensor);
+            ggml_tensor* timesteps  = nullptr;
             ggml_tensor* a_timestep = make_optional_input(audio_timesteps_tensor);
             ggml_tensor* context    = make_optional_input(context_tensor);
+
+            // A conditioned clip (I2V, FLF2V) passes one timestep per video token, yet only a few distinct values occur
+            // (kept keyframe tokens and the rest). The AdaLN tables then run on the distinct values, gathered per token
+            // where they are applied: at 1280×704×121 the per-token tables took ~9.8 GB of device memory per block.
+            // Only with a separate audio timestep — otherwise the audio branch reads the video timesteps as they are.
+            ggml_tensor* timestep_index = nullptr;
+            int64_t n_ts                = static_cast<int64_t>(timesteps_tensor.numel());
+            bool audio_separate         = !audio_timesteps_tensor.empty() || ax_input_cache.empty();
+            if (n_ts > 1 && audio_separate) {
+                std::vector<float> distinct;
+                std::vector<int32_t> index(static_cast<size_t>(n_ts));
+                const float* ts = timesteps_tensor.data();
+                for (int64_t i = 0; i < n_ts; i++) {
+                    auto it = std::find(distinct.begin(), distinct.end(), ts[i]);
+                    if (it == distinct.end()) {
+                        distinct.push_back(ts[i]);
+                        it = distinct.end() - 1;
+                    }
+                    index[static_cast<size_t>(i)] = static_cast<int32_t>(it - distinct.begin());
+                }
+                if (static_cast<int64_t>(distinct.size()) < n_ts) {
+                    timesteps_distinct_cache = sd::Tensor<float>::from_vector(distinct);
+                    timestep_index_cache     = sd::Tensor<int32_t>::from_vector(index);
+                    timesteps                = make_input(timesteps_distinct_cache);
+                    timestep_index           = make_input(timestep_index_cache);
+                    LOG_VERBOSE("ltxav: %zu distinct timesteps for %" PRId64 " video tokens", distinct.size(), n_ts);
+                }
+            }
+            if (timesteps == nullptr) {
+                timesteps = make_input(timesteps_tensor);
+            }
 
             ggml_cgraph* gf = new_graph_custom(LTXAV_GRAPH_SIZE);
 
@@ -1983,7 +2045,8 @@ namespace LTXV {
                                             video_cross_pe,
                                             audio_cross_pe,
                                             video_connector_pe,
-                                            audio_connector_pe);
+                                            audio_connector_pe,
+                                            timestep_index);
             auto out        = merge_av_latents(compute_ctx, out_pair.first, out_pair.second);
             ggml_build_forward_expand(gf, out);
             return gf;
