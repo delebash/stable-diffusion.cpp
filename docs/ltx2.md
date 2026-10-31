@@ -98,6 +98,16 @@ On the distilled model, run one pass at full size: in testing, a half-size pass 
 .\bin\Release\sd-cli.exe -M vid_gen --diffusion-model  ..\models\diffusion_models\ltx-2.3-22b-dev-UD-Q4_K_M.gguf --vae ..\models\vae\ltx-2.3-22b-dev_video_vae.safetensors --audio-vae ..\models\vae\ltx-2.3-22b-dev_audio_vae.safetensors --llm ..\models\text_encoders\gemma-3-12b-it-qat-UD-Q4_K_XL.gguf --embeddings-connectors ..\models\text_encoders\ltx-2.3-22b-dev_embeddings_connectors.safetensors  -p "a woman speaking to the camera" --cfg-scale 6.0 --sampling-method euler -v  -W 1280 -H 720 --offload-to-cpu --video-frames 121 -i ..\assets\ernie_image\turbo_example.png --audio line.wav -o a2v.webm
 ```
 
+### LTX-2.3 IC-LoRA guides
+
+An IC-LoRA follows a guide video: pass the LoRA in the prompt and the guide's frames with `--control-video`. A guide shorter than the clip holds its last frame. The guide is read in the first pass only, and with `--hires` the LoRA is removed for the refine pass.
+
+The guide's size comes from the LoRA's `reference_downscale_factor` metadata. With a half-size LoRA such as Motion Track or Union Control, `-W` and `-H` must be multiples of 64.
+
+```
+.\bin\Release\sd-cli.exe -M vid_gen --diffusion-model  ..\models\diffusion_models\ltx-2.3-22b-distilled-UD-Q4_K_M.gguf --vae ..\models\vae\ltx-2.3-22b-dev_video_vae.safetensors --audio-vae ..\models\vae\ltx-2.3-22b-dev_audio_vae.safetensors --llm ..\models\text_encoders\gemma-3-12b-it-qat-UD-Q4_K_XL.gguf --embeddings-connectors ..\models\text_encoders\ltx-2.3-22b-dev_embeddings_connectors.safetensors --lora-model-dir ..\models\loras -p "<lora:ltx-2.3-22b-ic-lora-union-control-ref0.5:1>a woman walks through a cafe" --cfg-scale 1.0 --sampling-method euler -v -W 1152 -H 640 --offload-to-cpu --video-frames 121 --control-video ..\assets\depth_frames -o guided.webm
+```
+
 ### LTX-2.3 spatial latent upscale
 
 LTX spatial latent upscale runs a model-backed x2 latent upsampler between the low-resolution video pass and the high-resolution refine pass. `-W` and `-H` are the pre-upscale generation size; the spatial upsampler produces x2 latent dimensions.
