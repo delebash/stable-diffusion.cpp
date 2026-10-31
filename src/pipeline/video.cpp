@@ -134,6 +134,41 @@ namespace sd::pipeline {
         return positions;
     }
 
+    // IC-LoRA guide: unlike a keyframe, its tokens share the target's causal time positions.
+    static sd::Tensor<float> build_ltxv_reference_positions(int64_t width,
+                                                            int64_t height,
+                                                            int64_t target_latent_frames,
+                                                            int64_t guide_latent_frames,
+                                                            int fps,
+                                                            int spatial_scale,
+                                                            int temporal_scale) {
+        GGML_ASSERT(width > 0 && height > 0 && target_latent_frames > 0);
+        GGML_ASSERT(guide_latent_frames > 0);
+        GGML_ASSERT(fps > 0);
+
+        int64_t total_tokens = width * height * (target_latent_frames + guide_latent_frames);
+        sd::Tensor<float> positions({2, 3, total_tokens, 1});
+        int64_t token = 0;
+
+        for (int64_t block : {target_latent_frames, guide_latent_frames}) {
+            for (int64_t t = 0; t < block; t++) {
+                float t_start = ltxv_latent_corner_to_pixel_frame(t, temporal_scale, true) / static_cast<float>(fps);
+                float t_end   = ltxv_latent_corner_to_pixel_frame(t + 1, temporal_scale, true) / static_cast<float>(fps);
+                for (int64_t h = 0; h < height; h++) {
+                    float h_start = static_cast<float>(h * spatial_scale);
+                    float h_end   = static_cast<float>((h + 1) * spatial_scale);
+                    for (int64_t w = 0; w < width; w++) {
+                        float w_start = static_cast<float>(w * spatial_scale);
+                        float w_end   = static_cast<float>((w + 1) * spatial_scale);
+                        set_ltxv_video_position(&positions, token++, t_start, t_end, h_start, h_end, w_start, w_end);
+                    }
+                }
+            }
+        }
+
+        return positions;
+    }
+
     static sd::Tensor<float> pack_ltxav_audio_and_video_latents(const sd::Tensor<float>& video_latent,
                                                                 const sd::Tensor<float>& audio_latent) {
         if (audio_latent.empty()) {
@@ -243,6 +278,35 @@ namespace sd::pipeline {
             LOG_ERROR("failed to encode LTXAV %s image", name);
         }
         return condition_latent;
+    }
+
+    // A guide shorter than the clip holds its last frame, so one still serves as a looped reference sheet.
+    static sd::Tensor<float> encode_ltxav_reference_video(StableDiffusionGGML* sd,
+                                                          const sd_image_t* frames,
+                                                          int frame_count,
+                                                          int width,
+                                                          int height,
+                                                          int video_frames) {
+        if (sd == nullptr || frames == nullptr || frame_count <= 0) {
+            return {};
+        }
+        sd::Tensor<float> video({width, height, video_frames, 3, 1});
+        for (int frame = 0; frame < video_frames; ++frame) {
+            auto source = ensure_image_tensor_channels(sd_image_to_tensor(frames[std::min(frame, frame_count - 1)],
+                                                                          width,
+                                                                          height),
+                                                       3);
+            if (source.empty()) {
+                LOG_ERROR("invalid LTXAV guide frame %d", frame + 1);
+                return {};
+            }
+            sd::ops::slice_assign(&video, 2, frame, frame + 1, source.unsqueeze(2));
+        }
+        auto guide_latent = sd->encode_first_stage(video);
+        if (guide_latent.empty()) {
+            LOG_ERROR("failed to encode LTXAV guide video");
+        }
+        return guide_latent;
     }
 
     static bool apply_ltxav_condition_by_latent_index(sd::Tensor<float>* video_latent,
@@ -778,16 +842,19 @@ namespace sd::pipeline {
         }
 
         if (sd_version_is_ltxav(sd->version)) {
-            if (sd_vid_gen_params->control_frames_size > 0) {
-                LOG_ERROR("LTXAV control_frames are not implemented");
+            bool has_guide = sd_vid_gen_params->control_frames_size > 0;
+            if (has_guide && !end_image.empty()) {
+                LOG_ERROR("LTXAV control_frames cannot be combined with an end image");
                 return std::nullopt;
             }
 
-            if (!start_image.empty() || !end_image.empty()) {
+            if (!start_image.empty() || !end_image.empty() || has_guide) {
                 if (!start_image.empty() && !end_image.empty()) {
                     LOG_INFO("FLF2V");
                 } else if (!start_image.empty()) {
-                    LOG_INFO("IMG2VID");
+                    LOG_INFO(has_guide ? "IMG2VID with IC-LoRA guide" : "IMG2VID");
+                } else if (has_guide) {
+                    LOG_INFO("TXT2VID with IC-LoRA guide");
                 } else {
                     LOG_INFO("END2VID");
                 }
@@ -863,6 +930,44 @@ namespace sd::pipeline {
                     if (!ok) {
                         return std::nullopt;
                     }
+                }
+
+                if (has_guide) {
+                    auto guide_latent = encode_ltxav_reference_video(sd,
+                                                                     sd_vid_gen_params->control_frames,
+                                                                     sd_vid_gen_params->control_frames_size,
+                                                                     request->width,
+                                                                     request->height,
+                                                                     request->frames);
+                    if (guide_latent.empty()) {
+                        return std::nullopt;
+                    }
+                    if (guide_latent.shape()[0] != latents.init_latent.shape()[0] ||
+                        guide_latent.shape()[1] != latents.init_latent.shape()[1] ||
+                        guide_latent.shape()[3] != latents.init_latent.shape()[3]) {
+                        LOG_ERROR("invalid LTXAV guide latent shape");
+                        return std::nullopt;
+                    }
+
+                    latents.video_target_frame_count       = latents.init_latent.shape()[2];
+                    latents.video_conditioning_frame_count = guide_latent.shape()[2];
+                    latents.init_latent                    = sd::ops::concat(latents.init_latent, guide_latent, 2);
+
+                    auto guide_mask      = sd::full<float>({guide_latent.shape()[0],
+                                                            guide_latent.shape()[1],
+                                                            guide_latent.shape()[2],
+                                                            1,
+                                                            1},
+                                                           0.f);
+                    latents.denoise_mask = sd::ops::concat(latents.denoise_mask, guide_mask, 2);
+                    latents.video_positions =
+                        build_ltxv_reference_positions(latents.init_latent.shape()[0],
+                                                       latents.init_latent.shape()[1],
+                                                       latents.video_target_frame_count,
+                                                       latents.video_conditioning_frame_count,
+                                                       request->fps,
+                                                       request->vae_scale_factor,
+                                                       8);
                 }
 
                 int64_t t2 = ggml_time_ms();
@@ -1315,6 +1420,19 @@ namespace sd::pipeline {
         }
 
         return result_images;
+    }
+
+    static sd::Tensor<float> crop_ltxav_guide_frames(StableDiffusionGGML* sd,
+                                                     const sd::Tensor<float>& packed_latent,
+                                                     int64_t target_frames,
+                                                     int audio_length) {
+        int latent_channels = sd->get_latent_channel();
+        if (packed_latent.shape()[3] <= latent_channels) {
+            return sd::ops::slice(packed_latent, 2, 0, target_frames);
+        }
+        auto video_latent = sd::ops::slice(packed_latent, 3, 0, latent_channels);
+        auto audio_latent = unpack_ltxav_audio_latent(packed_latent, audio_length, latent_channels);
+        return pack_ltxav_audio_and_video_latents(sd::ops::slice(video_latent, 2, 0, target_frames), audio_latent);
     }
 
     sd::Tensor<float> upscale_ltx_spatial_video_latent(StableDiffusionGGML* sd,
@@ -1779,6 +1897,19 @@ namespace sd::pipeline {
             if (sd->get_cancel_flag() == SD_CANCEL_ALL) {
                 LOG_ERROR("cancelling generation before latent upscale");
                 return false;
+            }
+            // Stage 2 refines the upscaled target alone, as Lightricks' IC-LoRA pipeline does by default.
+            if (sd_vid_gen_params->control_frames_size > 0 && latents.video_conditioning_frame_count > 0) {
+                final_latent                           = crop_ltxav_guide_frames(sd,
+                                                                                 final_latent,
+                                                                                 latents.video_target_frame_count,
+                                                                                 latents.audio_length);
+                latents.video_conditioning_frame_count = 0;
+                latents.video_target_frame_count       = 0;
+                latents.video_positions                = sd::Tensor<float>();
+                if (!sd->apply_loras(nullptr, 0)) {
+                    return false;
+                }
             }
             int64_t upscale_start             = ggml_time_ms();
             sd::Tensor<float> upscaled_latent = upscale_ltx_spatial_video_latent(sd,
