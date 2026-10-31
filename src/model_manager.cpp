@@ -1771,7 +1771,14 @@ ModelManager::CapacityCheck ModelManager::check_capacity(
 #ifdef _WIN32
     if (sd_backend_is(request.compute_backend, "CUDA")) {
         // Avoid WDDM allocation churn when transient buffers compete with reusable staging buffers.
-        safety_margin = 1024ULL * 1024ULL * 1024ULL;
+        // On a small card the larger reserve itself decides what fits.
+        size_t device_free = 0, device_total = 0;
+        if (auto device = ggml_backend_get_device(request.compute_backend)) {
+            ggml_backend_dev_memory(device, &device_free, &device_total);
+        }
+        if (device_total == 0 || device_total >= 12ULL * 1024ULL * 1024ULL * 1024ULL) {
+            safety_margin = 1024ULL * 1024ULL * 1024ULL;
+        }
     }
 #endif
     result.required_device_bytes = add(add(request.pending_allocation_bytes, missing), safety_margin);

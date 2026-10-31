@@ -1642,7 +1642,8 @@ namespace LTXV {
                                                       ggml_tensor* video_connector_pe,
                                                       ggml_tensor* audio_connector_pe,
                                                       ggml_tensor* timestep_index = nullptr,
-                                                      bool audio_frozen           = false) {
+                                                      bool audio_frozen           = false,
+                                                      ggml_tensor* video_guide    = nullptr) {
             auto patchify_proj       = std::dynamic_pointer_cast<Linear>(blocks["patchify_proj"]);
             auto audio_patchify_proj = std::dynamic_pointer_cast<Linear>(blocks["audio_patchify_proj"]);
             auto adaln_single        = std::dynamic_pointer_cast<AdaLayerNormSingle>(blocks["adaln_single"]);
@@ -1662,6 +1663,11 @@ namespace LTXV {
             vx = patchify_video(ctx, vx, n);
             vx = patchify_proj->forward(ctx, vx);
             vx = apply_keyframes_abs_pos_embedding(ctx, vx, width * height);
+            // IC-LoRA guide tokens are attended to after the target's and never reach the output.
+            int64_t target_tokens = vx->ne[1];
+            if (video_guide != nullptr) {
+                vx = ggml_concat(ctx->ggml_ctx, vx, patchify_proj->forward(ctx, patchify_video(ctx, video_guide, 1)), 1);
+            }
             if (ax != nullptr && ggml_nelements(ax) > 0 && audio_time > 0) {
                 ax = patchify_audio(ctx, ax);
                 ax = audio_patchify_proj->forward(ctx, ax);
@@ -1721,6 +1727,22 @@ namespace LTXV {
 
             sd::ggml_graph_cut::mark_graph_cut(vx, "ltxav.prelude", "vx");
             sd::ggml_graph_cut::mark_graph_cut(ax, "ltxav.prelude", "ax");
+            // The connectors and AdaLN tables hold about 3 GB of weights and run before the blocks: cutting here lets
+            // the blocks evict them instead of keeping them resident beside the first block.
+            sd::ggml_graph_cut::mark_graph_cut(v_context, "ltxav.prelude", "v_context");
+            if (a_context != v_context) {
+                sd::ggml_graph_cut::mark_graph_cut(a_context, "ltxav.prelude", "a_context");
+            }
+            sd::ggml_graph_cut::mark_graph_cut(v_timestep_mod, "ltxav.prelude", "v_timestep_mod");
+            sd::ggml_graph_cut::mark_graph_cut(a_timestep_mod, "ltxav.prelude", "a_timestep_mod");
+            sd::ggml_graph_cut::mark_graph_cut(v_embedded_time, "ltxav.prelude", "v_embedded_time");
+            sd::ggml_graph_cut::mark_graph_cut(a_embedded_time, "ltxav.prelude", "a_embedded_time");
+            sd::ggml_graph_cut::mark_graph_cut(v_prompt_timestep_mod, "ltxav.prelude", "v_prompt_timestep_mod");
+            sd::ggml_graph_cut::mark_graph_cut(a_prompt_timestep_mod, "ltxav.prelude", "a_prompt_timestep_mod");
+            sd::ggml_graph_cut::mark_graph_cut(av_ca_video_scale_shift_timestep, "ltxav.prelude", "av_ca_video_scale_shift");
+            sd::ggml_graph_cut::mark_graph_cut(av_ca_audio_scale_shift_timestep, "ltxav.prelude", "av_ca_audio_scale_shift");
+            sd::ggml_graph_cut::mark_graph_cut(av_ca_a2v_gate_noise_timestep, "ltxav.prelude", "av_ca_a2v_gate");
+            sd::ggml_graph_cut::mark_graph_cut(av_ca_v2a_gate_noise_timestep, "ltxav.prelude", "av_ca_v2a_gate");
 
             for (int i = 0; i < config.num_layers; i++) {
                 auto block = std::dynamic_pointer_cast<BasicAVTransformerBlock>(blocks["transformer_blocks." + std::to_string(i)]);
@@ -1754,7 +1776,10 @@ namespace LTXV {
             vx                 = norm_out->forward(ctx, vx);
             vx                 = LTXV::modulate(ctx->ggml_ctx, vx, v_shift_scale[0], v_shift_scale[1]);
             vx                 = proj_out->forward(ctx, vx);
-            vx                 = unpatchify_video(ctx, vx, width, height, frames);
+            if (video_guide != nullptr) {
+                vx = ggml_ext_slice(ctx->ggml_ctx, vx, 1, 0, target_tokens);
+            }
+            vx = unpatchify_video(ctx, vx, width, height, frames);
 
             if (ax != nullptr && audio_time > 0) {
                 auto a_shift_scale = get_output_scale_shift(ctx, params["audio_scale_shift_table"], a_embedded_time, config.audio_hidden_size);
@@ -1776,6 +1801,7 @@ namespace LTXV {
         sd::Tensor<float> ax_input_cache;
         sd::Tensor<float> timesteps_distinct_cache;
         sd::Tensor<int32_t> timestep_index_cache;
+        sd::Tensor<float> timesteps_with_guide_cache;
 
         LTXAVRunner(ggml_backend_t backend,
                     const String2TensorStorage& tensor_storage_map      = {},
@@ -1864,7 +1890,8 @@ namespace LTXV {
                                  int audio_length                                = 0,
                                  float frame_rate                                = 24.f,
                                  const sd::Tensor<float>& video_positions_tensor = {},
-                                 bool audio_frozen                               = false) {
+                                 bool audio_frozen                               = false,
+                                 const sd::Tensor<float>& video_guide_tensor     = {}) {
             auto split_inputs = split_av_latents(x_tensor, audio_length);
             vx_input_cache    = split_inputs.first;
             if (!audio_x_tensor.empty()) {
@@ -1878,18 +1905,31 @@ namespace LTXV {
             ggml_tensor* timesteps  = nullptr;
             ggml_tensor* a_timestep = make_optional_input(audio_timesteps_tensor);
             ggml_tensor* context    = make_optional_input(context_tensor);
+            ggml_tensor* guide      = make_optional_input(video_guide_tensor);
+
+            // Guide tokens are clean input, so they follow the target's tokens at timestep 0.
+            const sd::Tensor<float>* token_timesteps = &timesteps_tensor;
+            int64_t guide_token_count                = 0;
+            if (guide != nullptr) {
+                guide_token_count = guide->ne[0] * guide->ne[1] * guide->ne[2];
+                GGML_ASSERT(timesteps_tensor.numel() == vx->ne[0] * vx->ne[1] * vx->ne[2]);
+                std::vector<float> with_guide(timesteps_tensor.data(), timesteps_tensor.data() + timesteps_tensor.numel());
+                with_guide.resize(with_guide.size() + static_cast<size_t>(guide_token_count), 0.f);
+                timesteps_with_guide_cache = sd::Tensor<float>::from_vector(with_guide);
+                token_timesteps            = &timesteps_with_guide_cache;
+            }
 
             // A conditioned clip (I2V, FLF2V) passes one timestep per video token, yet only a few distinct values occur
             // (kept keyframe tokens and the rest). The AdaLN tables then run on the distinct values, gathered per token
             // where they are applied: at 1280×704×121 the per-token tables took ~9.8 GB of device memory per block.
             // Only with a separate audio timestep — otherwise the audio branch reads the video timesteps as they are.
             ggml_tensor* timestep_index = nullptr;
-            int64_t n_ts                = static_cast<int64_t>(timesteps_tensor.numel());
+            int64_t n_ts                = static_cast<int64_t>(token_timesteps->numel());
             bool audio_separate         = !audio_timesteps_tensor.empty() || ax_input_cache.empty();
             if (n_ts > 1 && audio_separate) {
                 std::vector<float> distinct;
                 std::vector<int32_t> index(static_cast<size_t>(n_ts));
-                const float* ts = timesteps_tensor.data();
+                const float* ts = token_timesteps->data();
                 for (int64_t i = 0; i < n_ts; i++) {
                     auto it = std::find(distinct.begin(), distinct.end(), ts[i]);
                     if (it == distinct.end()) {
@@ -1907,13 +1947,13 @@ namespace LTXV {
                 }
             }
             if (timesteps == nullptr) {
-                timesteps = make_input(timesteps_tensor);
+                timesteps = make_input(*token_timesteps);
             }
 
             ggml_cgraph* gf = new_graph_custom(LTXAV_GRAPH_SIZE);
 
             float video_frame_rate    = frame_rate > 0.f ? frame_rate : 24.f;
-            int64_t video_token_count = vx->ne[0] * vx->ne[1] * vx->ne[2];
+            int64_t video_token_count = vx->ne[0] * vx->ne[1] * vx->ne[2] + guide_token_count;
             bool has_video_positions  = !video_positions_tensor.empty();
             sd::PECacheKey video_pe_key("ltxav_video_pe");
             video_pe_key.add_shape(vx).add(video_frame_rate).add(video_positions_tensor).add(config.positional_embedding_theta);
@@ -2075,7 +2115,8 @@ namespace LTXV {
                                             video_connector_pe,
                                             audio_connector_pe,
                                             timestep_index,
-                                            audio_frozen);
+                                            audio_frozen,
+                                            guide);
             auto out        = merge_av_latents(compute_ctx, out_pair.first, out_pair.second);
             ggml_build_forward_expand(gf, out);
             return gf;
@@ -2090,9 +2131,10 @@ namespace LTXV {
                                   int audio_length                         = 0,
                                   float frame_rate                         = 24.f,
                                   const sd::Tensor<float>& video_positions = {},
-                                  bool audio_frozen                        = false) {
+                                  bool audio_frozen                        = false,
+                                  const sd::Tensor<float>& video_guide     = {}) {
             auto get_graph = [&]() -> ggml_cgraph* {
-                return build_graph(x, timesteps, context, audio_x, audio_timesteps, audio_length, frame_rate, video_positions, audio_frozen);
+                return build_graph(x, timesteps, context, audio_x, audio_timesteps, audio_length, frame_rate, video_positions, audio_frozen, video_guide);
             };
             auto out = restore_trailing_singleton_dims(GGMLRunner::compute(get_graph, n_threads, false), x.dim());
             return out;
@@ -2112,7 +2154,8 @@ namespace LTXV {
                            extra->audio_length,
                            extra->frame_rate,
                            tensor_or_empty(extra->video_positions),
-                           extra->audio_frozen);
+                           extra->audio_frozen,
+                           tensor_or_empty(extra->video_guide));
         }
 
         void test(const std::string& x_path,

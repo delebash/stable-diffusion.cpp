@@ -19,6 +19,7 @@ namespace sd::pipeline {
         sd::Tensor<float> img_uncond_concat_latent;
         sd::Tensor<float> audio_latent;
         sd::Tensor<float> video_positions;
+        sd::Tensor<float> video_guide_latent;
         sd::Tensor<float> control_image;
         std::vector<sd::Tensor<float>> ref_images;
         std::vector<sd::Tensor<float>> ref_latents;

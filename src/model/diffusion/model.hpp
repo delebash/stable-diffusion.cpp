@@ -123,6 +123,7 @@ struct LTXAVDiffusionExtra {
     float frame_rate                         = 24.f;
     const sd::Tensor<float>* video_positions = nullptr;
     bool audio_frozen                        = false;
+    const sd::Tensor<float>* video_guide     = nullptr;
 };
 
 enum class MiniMaxH3ReferenceKind : int32_t {

@@ -92,6 +92,7 @@ public:
         }
     };
     std::vector<RuntimeLora> runtime_lora_models;
+    int lora_reference_downscale_factor = 1;
     bool apply_lora_immediately = false;
     int animatediff_num_frames  = 0;
 
@@ -471,7 +472,8 @@ public:
                              float frame_rate,
                              const sd_cache_params_t* cache_params,
                              bool preview_final_step,
-                             const sd::Tensor<float>& video_positions = {});
+                             const sd::Tensor<float>& video_positions = {},
+                             const sd::Tensor<float>& video_guide     = {});
 
     int get_vae_scale_factor();
 

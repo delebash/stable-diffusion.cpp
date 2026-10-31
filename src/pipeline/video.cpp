@@ -134,32 +134,41 @@ namespace sd::pipeline {
         return positions;
     }
 
-    // IC-LoRA guide: unlike a keyframe, its tokens share the target's causal time positions.
+    // IC-LoRA guide: unlike a keyframe, its tokens share the target's causal time positions. A guide smaller than the
+    // target keeps its own grid, spread over the same pixels.
     static sd::Tensor<float> build_ltxv_reference_positions(int64_t width,
                                                             int64_t height,
-                                                            int64_t target_latent_frames,
-                                                            int64_t guide_latent_frames,
+                                                            int64_t latent_frames,
+                                                            int guide_downscale,
                                                             int fps,
                                                             int spatial_scale,
                                                             int temporal_scale) {
-        GGML_ASSERT(width > 0 && height > 0 && target_latent_frames > 0);
-        GGML_ASSERT(guide_latent_frames > 0);
+        GGML_ASSERT(width > 0 && height > 0 && latent_frames > 0);
+        GGML_ASSERT(guide_downscale > 0);
         GGML_ASSERT(fps > 0);
 
-        int64_t total_tokens = width * height * (target_latent_frames + guide_latent_frames);
+        struct Grid {
+            int64_t width;
+            int64_t height;
+            int spatial_scale;
+        };
+        const Grid target{width, height, spatial_scale};
+        const Grid guide{width / guide_downscale, height / guide_downscale, spatial_scale * guide_downscale};
+
+        int64_t total_tokens = latent_frames * (target.width * target.height + guide.width * guide.height);
         sd::Tensor<float> positions({2, 3, total_tokens, 1});
         int64_t token = 0;
 
-        for (int64_t block : {target_latent_frames, guide_latent_frames}) {
-            for (int64_t t = 0; t < block; t++) {
+        for (const Grid& grid : {target, guide}) {
+            for (int64_t t = 0; t < latent_frames; t++) {
                 float t_start = ltxv_latent_corner_to_pixel_frame(t, temporal_scale, true) / static_cast<float>(fps);
                 float t_end   = ltxv_latent_corner_to_pixel_frame(t + 1, temporal_scale, true) / static_cast<float>(fps);
-                for (int64_t h = 0; h < height; h++) {
-                    float h_start = static_cast<float>(h * spatial_scale);
-                    float h_end   = static_cast<float>((h + 1) * spatial_scale);
-                    for (int64_t w = 0; w < width; w++) {
-                        float w_start = static_cast<float>(w * spatial_scale);
-                        float w_end   = static_cast<float>((w + 1) * spatial_scale);
+                for (int64_t h = 0; h < grid.height; h++) {
+                    float h_start = static_cast<float>(h * grid.spatial_scale);
+                    float h_end   = static_cast<float>((h + 1) * grid.spatial_scale);
+                    for (int64_t w = 0; w < grid.width; w++) {
+                        float w_start = static_cast<float>(w * grid.spatial_scale);
+                        float w_end   = static_cast<float>((w + 1) * grid.spatial_scale);
                         set_ltxv_video_position(&positions, token++, t_start, t_end, h_start, h_end, w_start, w_end);
                     }
                 }
@@ -996,41 +1005,35 @@ namespace sd::pipeline {
                 }
 
                 if (has_guide) {
-                    auto guide_latent = encode_ltxav_reference_video(sd,
-                                                                     sd_vid_gen_params->control_frames,
-                                                                     sd_vid_gen_params->control_frames_size,
-                                                                     request->width,
-                                                                     request->height,
-                                                                     request->frames);
-                    if (guide_latent.empty()) {
+                    int guide_downscale = sd->lora_reference_downscale_factor;
+                    if (request->width % (request->vae_scale_factor * guide_downscale) != 0 ||
+                        request->height % (request->vae_scale_factor * guide_downscale) != 0) {
+                        LOG_ERROR("this LoRA's guide is 1/%d size: width and height must be multiples of %d",
+                                  guide_downscale,
+                                  request->vae_scale_factor * guide_downscale);
                         return std::nullopt;
                     }
-                    if (guide_latent.shape()[0] != latents.init_latent.shape()[0] ||
-                        guide_latent.shape()[1] != latents.init_latent.shape()[1] ||
-                        guide_latent.shape()[3] != latents.init_latent.shape()[3]) {
+                    latents.video_guide_latent = encode_ltxav_reference_video(sd,
+                                                                              sd_vid_gen_params->control_frames,
+                                                                              sd_vid_gen_params->control_frames_size,
+                                                                              request->width / guide_downscale,
+                                                                              request->height / guide_downscale,
+                                                                              request->frames);
+                    if (latents.video_guide_latent.empty()) {
+                        return std::nullopt;
+                    }
+                    if (latents.video_guide_latent.shape()[2] != latents.init_latent.shape()[2] ||
+                        latents.video_guide_latent.shape()[3] != latents.init_latent.shape()[3]) {
                         LOG_ERROR("invalid LTXAV guide latent shape");
                         return std::nullopt;
                     }
-
-                    latents.video_target_frame_count       = latents.init_latent.shape()[2];
-                    latents.video_conditioning_frame_count = guide_latent.shape()[2];
-                    latents.init_latent                    = sd::ops::concat(latents.init_latent, guide_latent, 2);
-
-                    auto guide_mask      = sd::full<float>({guide_latent.shape()[0],
-                                                            guide_latent.shape()[1],
-                                                            guide_latent.shape()[2],
-                                                            1,
-                                                            1},
-                                                           0.f);
-                    latents.denoise_mask = sd::ops::concat(latents.denoise_mask, guide_mask, 2);
-                    latents.video_positions =
-                        build_ltxv_reference_positions(latents.init_latent.shape()[0],
-                                                       latents.init_latent.shape()[1],
-                                                       latents.video_target_frame_count,
-                                                       latents.video_conditioning_frame_count,
-                                                       request->fps,
-                                                       request->vae_scale_factor,
-                                                       8);
+                    latents.video_positions = build_ltxv_reference_positions(latents.init_latent.shape()[0],
+                                                                             latents.init_latent.shape()[1],
+                                                                             latents.init_latent.shape()[2],
+                                                                             guide_downscale,
+                                                                             request->fps,
+                                                                             request->vae_scale_factor,
+                                                                             8);
                 }
 
                 int64_t t2 = ggml_time_ms();
@@ -1490,19 +1493,6 @@ namespace sd::pipeline {
         return result_images;
     }
 
-    static sd::Tensor<float> crop_ltxav_guide_frames(StableDiffusionGGML* sd,
-                                                     const sd::Tensor<float>& packed_latent,
-                                                     int64_t target_frames,
-                                                     int audio_length) {
-        int latent_channels = sd->get_latent_channel();
-        if (packed_latent.shape()[3] <= latent_channels) {
-            return sd::ops::slice(packed_latent, 2, 0, target_frames);
-        }
-        auto video_latent = sd::ops::slice(packed_latent, 3, 0, latent_channels);
-        auto audio_latent = unpack_ltxav_audio_latent(packed_latent, audio_length, latent_channels);
-        return pack_ltxav_audio_and_video_latents(sd::ops::slice(video_latent, 2, 0, target_frames), audio_latent);
-    }
-
     sd::Tensor<float> upscale_ltx_spatial_video_latent(StableDiffusionGGML* sd,
                                                        const char* model_path,
                                                        const sd::Tensor<float>& packed_latent,
@@ -1954,7 +1944,8 @@ namespace sd::pipeline {
                                                     static_cast<float>(request.fps),
                                                     request.cache_params,
                                                     plan.high_noise_sample_steps <= 0,
-                                                    latents.video_positions);
+                                                    latents.video_positions,
+                                                    latents.video_guide_latent);
 
         int64_t sampling_end = ggml_time_ms();
         if (final_latent.empty()) {
@@ -1969,14 +1960,9 @@ namespace sd::pipeline {
                 return false;
             }
             // Stage 2 refines the upscaled target alone, as Lightricks' IC-LoRA pipeline does by default.
-            if (sd_vid_gen_params->control_frames_size > 0 && latents.video_conditioning_frame_count > 0) {
-                final_latent                           = crop_ltxav_guide_frames(sd,
-                                                                                 final_latent,
-                                                                                 latents.video_target_frame_count,
-                                                                                 latents.audio_length);
-                latents.video_conditioning_frame_count = 0;
-                latents.video_target_frame_count       = 0;
-                latents.video_positions                = sd::Tensor<float>();
+            if (!latents.video_guide_latent.empty()) {
+                latents.video_guide_latent = sd::Tensor<float>();
+                latents.video_positions    = sd::Tensor<float>();
                 if (!sd->apply_loras(nullptr, 0)) {
                     return false;
                 }

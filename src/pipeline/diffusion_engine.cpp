@@ -1856,6 +1856,21 @@ bool StableDiffusionGGML::apply_loras(const sd_lora_t* loras, uint32_t lora_coun
         runtime_lora_models.clear();
         return false;
     }
+    // An IC-LoRA records the guide size it was trained on, relative to the output.
+    lora_reference_downscale_factor = 1;
+    for (const auto& lora : all_loras) {
+        const auto metadata = model_manager->loader().file_metadata(lora.file_id);
+        const auto entry    = metadata.find("reference_downscale_factor");
+        if (entry == metadata.end()) {
+            continue;
+        }
+        int factor = std::atoi(entry->second.c_str());
+        if (factor > 1 && lora_reference_downscale_factor > 1 && factor != lora_reference_downscale_factor) {
+            LOG_ERROR("LoRAs disagree on the guide size: 1/%d and 1/%d", lora_reference_downscale_factor, factor);
+            return false;
+        }
+        lora_reference_downscale_factor = std::max(lora_reference_downscale_factor, factor);
+    }
     runner_state_.catalog_revision = model_manager->loader().revision();
     int64_t t1                     = ggml_time_ms();
     if (!all_loras.empty()) {
@@ -2320,7 +2335,8 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
                                               float frame_rate,
                                               const sd_cache_params_t* cache_params,
                                               bool preview_final_step,
-                                              const sd::Tensor<float>& video_positions) {
+                                              const sd::Tensor<float>& video_positions,
+                                              const sd::Tensor<float>& video_guide) {
     struct RunnerEndOnExit {
         GGMLRunner* runner = nullptr;
         ~RunnerEndOnExit() {
@@ -2609,7 +2625,8 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
                     audio_length,
                     frame_rate,
                     video_positions.empty() ? nullptr : &video_positions,
-                    ltxav_audio_frozen};
+                    ltxav_audio_frozen,
+                    video_guide.empty() ? nullptr : &video_guide};
             } else if (sd_version_is_minit2i(version)) {
                 diffusion_params.extra = MiniT2IDiffusionExtra{
                     condition.c_vector.empty() ? nullptr : &condition.c_vector};
