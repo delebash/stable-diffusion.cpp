@@ -1641,7 +1641,8 @@ namespace LTXV {
                                                       ggml_tensor* a_cross_pe,
                                                       ggml_tensor* video_connector_pe,
                                                       ggml_tensor* audio_connector_pe,
-                                                      ggml_tensor* timestep_index = nullptr) {
+                                                      ggml_tensor* timestep_index = nullptr,
+                                                      bool audio_frozen           = false) {
             auto patchify_proj       = std::dynamic_pointer_cast<Linear>(blocks["patchify_proj"]);
             auto audio_patchify_proj = std::dynamic_pointer_cast<Linear>(blocks["audio_patchify_proj"]);
             auto adaln_single        = std::dynamic_pointer_cast<AdaLayerNormSingle>(blocks["adaln_single"]);
@@ -1683,7 +1684,9 @@ namespace LTXV {
 
             ggml_tensor* effective_audio_timestep = audio_timestep != nullptr ? audio_timestep : timestep;
             auto a_timestep_scaled                = ggml_ext_scale(ctx->ggml_ctx, effective_audio_timestep, config.timestep_scale_multiplier);
-            auto a_pair                           = audio_adaln_single->forward(ctx, a_timestep_scaled);
+            // A frozen audio lane (A2V) is clean input: only its own AdaLN sees timestep 0, the prompt and gate AdaLNs keep sigma.
+            auto a_lane_timestep_scaled = audio_frozen ? ggml_ext_scale(ctx->ggml_ctx, a_timestep_scaled, 0.f) : a_timestep_scaled;
+            auto a_pair                 = audio_adaln_single->forward(ctx, a_lane_timestep_scaled);
             auto a_timestep_mod                   = a_pair.first;
             auto a_embedded_time                  = a_pair.second;
 
@@ -1701,7 +1704,7 @@ namespace LTXV {
             auto av_ca_video_timestep = timestep_index != nullptr && effective_audio_timestep->ne[0] == 1
                                             ? effective_audio_timestep
                                             : repeat_scalar_timestep_like(ctx, effective_audio_timestep, timestep);
-            auto av_ca_audio_timestep = effective_audio_timestep;
+            auto av_ca_audio_timestep = audio_frozen ? ggml_ext_scale(ctx->ggml_ctx, effective_audio_timestep, 0.f) : effective_audio_timestep;
             auto av_ca_factor         = config.av_ca_timestep_scale_multiplier / config.timestep_scale_multiplier;
             auto av_ca_video_scale_shift_timestep =
                 std::dynamic_pointer_cast<AdaLayerNormSingle>(blocks["av_ca_video_scale_shift_adaln_single"])->forward(ctx, av_ca_video_timestep).first;
@@ -1713,7 +1716,7 @@ namespace LTXV {
                 std::dynamic_pointer_cast<AdaLayerNormSingle>(blocks["av_ca_audio_scale_shift_adaln_single"])->forward(ctx, av_ca_audio_timestep).first;
             auto av_ca_v2a_gate_noise_timestep =
                 std::dynamic_pointer_cast<AdaLayerNormSingle>(blocks["av_ca_v2a_gate_adaln_single"])
-                    ->forward(ctx, ggml_ext_scale(ctx->ggml_ctx, av_ca_audio_timestep, av_ca_factor))
+                    ->forward(ctx, ggml_ext_scale(ctx->ggml_ctx, effective_audio_timestep, av_ca_factor))
                     .first;
 
             sd::ggml_graph_cut::mark_graph_cut(vx, "ltxav.prelude", "vx");
@@ -1860,7 +1863,8 @@ namespace LTXV {
                                  const sd::Tensor<float>& audio_timesteps_tensor = {},
                                  int audio_length                                = 0,
                                  float frame_rate                                = 24.f,
-                                 const sd::Tensor<float>& video_positions_tensor = {}) {
+                                 const sd::Tensor<float>& video_positions_tensor = {},
+                                 bool audio_frozen                               = false) {
             auto split_inputs = split_av_latents(x_tensor, audio_length);
             vx_input_cache    = split_inputs.first;
             if (!audio_x_tensor.empty()) {
@@ -2070,7 +2074,8 @@ namespace LTXV {
                                             audio_cross_pe,
                                             video_connector_pe,
                                             audio_connector_pe,
-                                            timestep_index);
+                                            timestep_index,
+                                            audio_frozen);
             auto out        = merge_av_latents(compute_ctx, out_pair.first, out_pair.second);
             ggml_build_forward_expand(gf, out);
             return gf;
@@ -2084,9 +2089,10 @@ namespace LTXV {
                                   const sd::Tensor<float>& audio_timesteps = {},
                                   int audio_length                         = 0,
                                   float frame_rate                         = 24.f,
-                                  const sd::Tensor<float>& video_positions = {}) {
+                                  const sd::Tensor<float>& video_positions = {},
+                                  bool audio_frozen                        = false) {
             auto get_graph = [&]() -> ggml_cgraph* {
-                return build_graph(x, timesteps, context, audio_x, audio_timesteps, audio_length, frame_rate, video_positions);
+                return build_graph(x, timesteps, context, audio_x, audio_timesteps, audio_length, frame_rate, video_positions, audio_frozen);
             };
             auto out = restore_trailing_singleton_dims(GGMLRunner::compute(get_graph, n_threads, false), x.dim());
             return out;
@@ -2105,7 +2111,8 @@ namespace LTXV {
                            tensor_or_empty(extra->audio_timesteps),
                            extra->audio_length,
                            extra->frame_rate,
-                           tensor_or_empty(extra->video_positions));
+                           tensor_or_empty(extra->video_positions),
+                           extra->audio_frozen);
         }
 
         void test(const std::string& x_path,

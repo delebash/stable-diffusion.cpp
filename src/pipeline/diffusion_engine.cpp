@@ -1329,7 +1329,7 @@ bool StableDiffusionGGML::validate_and_load_runners() {
     }
 
     if (audio_vae_model) {
-        if (!sd_version_is_minimax_h3(version)) {
+        if (!sd_version_is_minimax_h3(version) && !sd_version_is_ltxav(version)) {
             ignore_tensors.insert("audio_vae.encoder");
         }
     }
@@ -2345,6 +2345,11 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
     const bool apply_denoise_mask = !denoise_mask.empty() &&
                                     std::any_of(denoise_mask.values().begin(), denoise_mask.values().end(),
                                                 [](float value) { return value != 1.f; });
+    // The audio lane sits in the mask's channels past the video latent, and A2V freezes all of it.
+    const bool ltxav_audio_frozen = sd_version_is_ltxav(version) && !denoise_mask.empty() &&
+                                    denoise_mask.shape()[3] > get_latent_channel() &&
+                                    (denoise_mask.dim() == 5 ? denoise_mask.index(0, 0, 0, get_latent_channel(), 0)
+                                                             : denoise_mask.index(0, 0, 0, get_latent_channel())) == 0.f;
 
     std::vector<int> skip_layers(guidance.slg.layers, guidance.slg.layers + guidance.slg.layer_count);
     float cfg_scale     = guidance.txt_cfg;
@@ -2603,7 +2608,8 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
                     audio_timesteps_tensor.empty() ? nullptr : &audio_timesteps_tensor,
                     audio_length,
                     frame_rate,
-                    video_positions.empty() ? nullptr : &video_positions};
+                    video_positions.empty() ? nullptr : &video_positions,
+                    ltxav_audio_frozen};
             } else if (sd_version_is_minit2i(version)) {
                 diffusion_params.extra = MiniT2IDiffusionExtra{
                     condition.c_vector.empty() ? nullptr : &condition.c_vector};

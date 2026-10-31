@@ -1809,7 +1809,7 @@ ArgOptions SDGenerationParams::get_options() {
          on_ref_audio_arg},
         {"",
          "--audio",
-         "driving audio track (Wan2.2 S2V; can be used once)",
+         "driving audio track (Wan2.2 S2V, LTX audio-to-video; can be used once)",
          on_audio_arg},
         {"",
          "--cache-mode",

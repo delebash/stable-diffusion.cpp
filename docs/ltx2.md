@@ -88,6 +88,14 @@ To run the text encoder quantized, convert it once with sd-cli:
   muted
   style="max-width: 100%; height: auto;"></video>
 
+### LTX-2.3 audio-to-video
+
+`--audio` drives the clip with a WAV: the audio lane stays frozen in both passes, the mouth follows the track, and the track is the clip's sound. A track shorter than the clip ends in silence; a longer one is cut for conditioning. Needs the audio VAE's encoder weights, which the audio VAE file above has.
+
+```
+.\bin\Release\sd-cli.exe -M vid_gen --diffusion-model  ..\models\diffusion_models\ltx-2.3-22b-dev-UD-Q4_K_M.gguf --vae ..\models\vae\ltx-2.3-22b-dev_video_vae.safetensors --audio-vae ..\models\vae\ltx-2.3-22b-dev_audio_vae.safetensors --llm ..\models\text_encoders\gemma-3-12b-it-qat-UD-Q4_K_XL.gguf --embeddings-connectors ..\models\text_encoders\ltx-2.3-22b-dev_embeddings_connectors.safetensors  -p "a woman speaking to the camera" --cfg-scale 6.0 --sampling-method euler -v  -W 1280 -H 720 --offload-to-cpu --video-frames 121 -i ..\assets\ernie_image\turbo_example.png --audio line.wav -o a2v.webm
+```
+
 ### LTX-2.3 spatial latent upscale
 
 LTX spatial latent upscale runs a model-backed x2 latent upsampler between the low-resolution video pass and the high-resolution refine pass. `-W` and `-H` are the pre-upscale generation size; the spatial upsampler produces x2 latent dimensions.

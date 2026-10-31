@@ -203,7 +203,8 @@ namespace sd::pipeline {
 
     static sd::Tensor<float> pack_ltxav_audio_and_video_denoise_mask(const sd::Tensor<float>& video_mask,
                                                                      const sd::Tensor<float>& video_latent,
-                                                                     const sd::Tensor<float>& audio_latent) {
+                                                                     const sd::Tensor<float>& audio_latent,
+                                                                     float audio_mask_value = 1.f) {
         if (video_mask.empty() || audio_latent.empty()) {
             return video_mask;
         }
@@ -246,7 +247,7 @@ namespace sd::pipeline {
 
         std::vector<int64_t> audio_mask_shape = video_latent.shape();
         audio_mask_shape[3]                   = extra_ch;
-        auto audio_mask                       = sd::Tensor<float>::ones(audio_mask_shape);
+        auto audio_mask                       = sd::full<float>(audio_mask_shape, audio_mask_value);
         return sd::ops::concat(video_mask_full, audio_mask, 3);
     }
 
@@ -435,6 +436,52 @@ namespace sd::pipeline {
             return {};
         }
         return sd::zeros<float>({audio_length, 2, 32, 1});
+    }
+
+    // A2V: the driving track is the clip's sound, so the audio lane stays frozen in both stages.
+    static bool ltxav_audio_is_driven(const StableDiffusionGGML* sd, const sd_vid_gen_params_t* sd_vid_gen_params) {
+        return sd_version_is_ltxav(sd->version) && sd_vid_gen_params->ref_audios_count > 0;
+    }
+
+    // Resamples with torchaudio.functional.resample's Hann-windowed sinc, as Lightricks' pipeline does, and fits the
+    // track to the clip: past its end the waveform is silence, which the encoder turns into real silence latents.
+    static sd::Tensor<float> prepare_ltxav_driving_waveform(const sd_audio_t& audio,
+                                                            int target_sample_rate,
+                                                            int64_t target_samples) {
+        if (audio.data == nullptr || audio.sample_count == 0 || audio.channels == 0 || audio.sample_rate == 0) {
+            return {};
+        }
+        constexpr double kPi            = 3.14159265358979323846;
+        constexpr double kRolloff       = 0.99;
+        constexpr double kLowpassWidth  = 6.0;
+        const double ratio              = static_cast<double>(target_sample_rate) / audio.sample_rate;
+        const double cutoff             = std::min(1.0, ratio) * kRolloff;
+        const int64_t half_taps         = static_cast<int64_t>(std::ceil(kLowpassWidth / cutoff));
+        const int64_t source_count      = static_cast<int64_t>(audio.sample_count);
+        const int64_t resampled_samples = std::min<int64_t>(target_samples, std::llround(source_count * ratio));
+
+        auto waveform = sd::zeros<float>({target_samples, 2, 1, 1});
+        for (int64_t t = 0; t < resampled_samples; ++t) {
+            const double center = t / ratio;
+            const int64_t first = std::max<int64_t>(0, static_cast<int64_t>(std::floor(center)) - half_taps);
+            const int64_t last  = std::min<int64_t>(source_count - 1, static_cast<int64_t>(std::ceil(center)) + half_taps);
+            for (uint32_t channel = 0; channel < 2; ++channel) {
+                uint32_t source_channel = std::min<uint32_t>(channel, audio.channels - 1);
+                double value            = 0.0;
+                if (audio.sample_rate == static_cast<uint32_t>(target_sample_rate)) {
+                    value = audio.data[t * audio.channels + source_channel];
+                } else {
+                    for (int64_t i = first; i <= last; ++i) {
+                        double x      = (i - center) * cutoff;
+                        double window = std::cos(std::clamp(x, -kLowpassWidth, kLowpassWidth) * kPi / kLowpassWidth / 2.0);
+                        double sinc   = x == 0.0 ? 1.0 : std::sin(kPi * x) / (kPi * x);
+                        value += audio.data[i * audio.channels + source_channel] * sinc * window * window * cutoff;
+                    }
+                }
+                waveform.index(t, channel, 0, 0) = static_cast<float>(std::clamp(value, -1.0, 1.0));
+            }
+        }
+        return waveform;
     }
 
     static sd::Tensor<float> prepare_minimax_h3_reference_waveform(const sd_audio_t& audio,
@@ -839,6 +886,22 @@ namespace sd::pipeline {
         if (sd_version_is_ltxav(sd->version)) {
             latents.audio_length = get_ltxav_num_audio_latents(request->frames, request->fps);
             latents.audio_latent = make_ltxav_empty_audio_latent(latents.audio_length);
+            if (ltxav_audio_is_driven(sd, sd_vid_gen_params)) {
+                if (sd->audio_vae_model == nullptr) {
+                    LOG_ERROR("LTXAV driving audio requires --audio-vae with encoder weights");
+                    return std::nullopt;
+                }
+                int sample_rate       = sd->audio_vae_model->input_sample_rate();
+                int64_t clip_samples  = static_cast<int64_t>(std::ceil(static_cast<double>(request->frames) / request->fps * sample_rate));
+                auto waveform         = prepare_ltxav_driving_waveform(sd_vid_gen_params->ref_audios[0], sample_rate, clip_samples);
+                auto encoded          = waveform.empty() ? sd::Tensor<float>() : sd->audio_vae_model->encode(sd->n_threads, waveform);
+                sd->audio_vae_model->runner_end();
+                if (encoded.empty()) {
+                    LOG_ERROR("failed to encode the LTXAV driving audio");
+                    return std::nullopt;
+                }
+                latents.audio_latent = resize_ltxav_audio_latent(encoded, latents.audio_length);
+            }
         }
 
         if (sd_version_is_ltxav(sd->version)) {
@@ -1286,10 +1349,15 @@ namespace sd::pipeline {
 
         if ((sd_version_is_ltxav(sd->version) || sd_version_is_minimax_h3(sd->version)) &&
             !latents.audio_latent.empty()) {
+            bool audio_driven = ltxav_audio_is_driven(sd, sd_vid_gen_params);
+            if (audio_driven && latents.denoise_mask.empty()) {
+                latents.denoise_mask = make_ltxav_video_denoise_mask(latents.init_latent, 1.f);
+            }
             if (!latents.denoise_mask.empty()) {
                 latents.denoise_mask = pack_ltxav_audio_and_video_denoise_mask(latents.denoise_mask,
                                                                                latents.init_latent,
-                                                                               latents.audio_latent);
+                                                                               latents.audio_latent,
+                                                                               audio_driven ? 0.f : 1.f);
             }
             latents.init_latent = pack_ltxav_audio_and_video_latents(latents.init_latent, latents.audio_latent);
         }
@@ -1562,8 +1630,10 @@ namespace sd::pipeline {
             latent == nullptr || latent->empty() || denoise_mask == nullptr || video_positions == nullptr) {
             return true;
         }
+        bool audio_driven = ltxav_audio_is_driven(sd, sd_vid_gen_params);
         if (sd_vid_gen_params->init_image.data == nullptr &&
-            sd_vid_gen_params->end_image.data == nullptr) {
+            sd_vid_gen_params->end_image.data == nullptr &&
+            !audio_driven) {
             return true;
         }
         constexpr float conditioning_strength = 1.f;
@@ -1646,7 +1716,7 @@ namespace sd::pipeline {
 
         if (!audio_latent.empty()) {
             *latent       = pack_ltxav_audio_and_video_latents(video_latent, audio_latent);
-            *denoise_mask = pack_ltxav_audio_and_video_denoise_mask(video_mask, video_latent, audio_latent);
+            *denoise_mask = pack_ltxav_audio_and_video_denoise_mask(video_mask, video_latent, audio_latent, audio_driven ? 0.f : 1.f);
         } else {
             *latent       = std::move(video_latent);
             *denoise_mask = std::move(video_mask);
@@ -2051,7 +2121,8 @@ namespace sd::pipeline {
         LOG_INFO("generating latent video completed, taking %.2fs", (latent_end - latent_start) * 1.0f / 1000);
 
         sd_audio_t* generated_audio = nullptr;
-        if (sd->version == VERSION_WAN2_2_S2V && sd_vid_gen_params->ref_audios_count > 0) {
+        if ((sd->version == VERSION_WAN2_2_S2V || ltxav_audio_is_driven(sd, sd_vid_gen_params)) &&
+            sd_vid_gen_params->ref_audios_count > 0) {
             // Return the driving track for muxing with the generated video.
             const sd_audio_t& driving = sd_vid_gen_params->ref_audios[0];
             generated_audio           = (sd_audio_t*)malloc(sizeof(sd_audio_t));
@@ -2079,6 +2150,7 @@ namespace sd::pipeline {
             }
         }
         if ((sd_version_is_ltxav(sd->version) || sd_version_is_minimax_h3(sd->version)) &&
+            !ltxav_audio_is_driven(sd, sd_vid_gen_params) &&
             latents.audio_length > 0 &&
             sd->audio_vae_model != nullptr) {
             if (sd->get_cancel_flag() == SD_CANCEL_ALL) {
