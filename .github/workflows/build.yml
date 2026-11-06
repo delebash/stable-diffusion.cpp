@@ -199,7 +199,8 @@ jobs:
 
   build-and-push-docker-images:
     name: Build and push container images
-    if: ${{ github.event_name != 'pull_request' }}
+    # jd fork: container images are upstream's to publish, never pushed from the fork
+    if: ${{ github.event_name != 'pull_request' && github.repository == 'leejet/stable-diffusion.cpp' }}
     runs-on: ${{ matrix.runner }}
 
     permissions:
@@ -819,7 +820,6 @@ jobs:
       - ubuntu-latest-cmake
       - ubuntu-latest-cmake-vulkan
       - ubuntu-latest-rocm
-      - build-and-push-docker-images
       - macOS-latest-cmake
       - windows-latest-cmake
       - windows-latest-rocm
