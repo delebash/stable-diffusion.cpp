@@ -36,13 +36,13 @@ namespace Lens {
                     continue;
                 }
                 if (ends_with(name, "img_in.weight") && tensor_storage.n_dims == 2) {
-                    config.in_channels = tensor_storage.ne[0];
+                    config.in_channels = tensor_storage.logical_ne0();
                     int64_t inner_dim  = tensor_storage.ne[1];
                     if (config.attention_head_dim > 0) {
                         config.num_attention_heads = inner_dim / config.attention_head_dim;
                     }
                 } else if (ends_with(name, "txt_in.weight") && tensor_storage.n_dims == 2) {
-                    config.selected_layer_count = static_cast<int>(tensor_storage.ne[0] / config.joint_attention_dim);
+                    config.selected_layer_count = static_cast<int>(tensor_storage.logical_ne0() / config.joint_attention_dim);
                 } else if (ends_with(name, "proj_out.weight") && tensor_storage.n_dims == 2) {
                     int64_t patch_area  = config.patch_size * config.patch_size;
                     config.out_channels = tensor_storage.ne[1] / patch_area;
@@ -237,9 +237,9 @@ namespace Lens {
             auto txt_mod_vec    = ggml_ext_chunk(ctx->ggml_ctx, txt_mod_params, 6, 0);
 
             auto img_normed    = img_norm1->forward(ctx, img);
-            auto img_modulated = Flux::modulate(ctx->ggml_ctx, img_normed, img_mod_vec[0], img_mod_vec[1]);
+            auto img_modulated = Flux::modulate(ctx, img_normed, img_mod_vec[0], img_mod_vec[1]);
             auto txt_normed    = txt_norm1->forward(ctx, txt);
-            auto txt_modulated = Flux::modulate(ctx->ggml_ctx, txt_normed, txt_mod_vec[0], txt_mod_vec[1]);
+            auto txt_modulated = Flux::modulate(ctx, txt_normed, txt_mod_vec[0], txt_mod_vec[1]);
 
             auto [img_attn_output, txt_attn_output] = attn->forward(ctx, img_modulated, txt_modulated, pe);
 
@@ -247,9 +247,9 @@ namespace Lens {
             txt = ggml_add(ctx->ggml_ctx, txt, ggml_mul(ctx->ggml_ctx, txt_attn_output, txt_mod_vec[2]));
 
             auto img_normed2    = img_norm2->forward(ctx, img);
-            auto img_modulated2 = Flux::modulate(ctx->ggml_ctx, img_normed2, img_mod_vec[3], img_mod_vec[4]);
+            auto img_modulated2 = Flux::modulate(ctx, img_normed2, img_mod_vec[3], img_mod_vec[4]);
             auto txt_normed2    = txt_norm2->forward(ctx, txt);
-            auto txt_modulated2 = Flux::modulate(ctx->ggml_ctx, txt_normed2, txt_mod_vec[3], txt_mod_vec[4]);
+            auto txt_modulated2 = Flux::modulate(ctx, txt_normed2, txt_mod_vec[3], txt_mod_vec[4]);
 
             img = ggml_add(ctx->ggml_ctx, img, ggml_mul(ctx->ggml_ctx, img_mlp->forward(ctx, img_modulated2), img_mod_vec[5]));
             txt = ggml_add(ctx->ggml_ctx, txt, ggml_mul(ctx->ggml_ctx, txt_mlp->forward(ctx, txt_modulated2), txt_mod_vec[5]));
@@ -272,7 +272,7 @@ namespace Lens {
             auto scale  = mods[0];
             auto shift  = mods[1];
             x           = ggml_norm(ctx->ggml_ctx, x, eps);
-            return Flux::modulate(ctx->ggml_ctx, x, shift, scale);
+            return Flux::modulate(ctx, x, shift, scale);
         }
     };
 

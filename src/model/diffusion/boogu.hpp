@@ -72,10 +72,10 @@ namespace Boogu {
                 }
                 if (ends_with(name, "x_embedder.weight") && tensor_storage.n_dims == 2) {
                     int64_t patch_area = config.patch_size * config.patch_size;
-                    config.in_channels = tensor_storage.ne[0] / patch_area;
+                    config.in_channels = tensor_storage.logical_ne0() / patch_area;
                     config.hidden_size = tensor_storage.ne[1];
                 } else if (ends_with(name, "time_caption_embed.caption_embedder.1.weight") && tensor_storage.n_dims == 2) {
-                    config.instruction_feat_dim = tensor_storage.ne[0];
+                    config.instruction_feat_dim = tensor_storage.logical_ne0();
                     config.hidden_size          = tensor_storage.ne[1];
                 } else if (ends_with(name, "single_stream_layers.0.attn.norm_q.weight") && tensor_storage.n_dims == 1) {
                     detected_head_dim = tensor_storage.ne[0];
@@ -128,9 +128,9 @@ namespace Boogu {
         }
     };
 
-    __STATIC_INLINE__ ggml_tensor* scale_modulate(ggml_context* ctx, ggml_tensor* x, ggml_tensor* scale) {
-        scale = ggml_reshape_3d(ctx, scale, scale->ne[0], 1, scale->ne[1]);
-        return ggml_add(ctx, x, ggml_mul(ctx, x, scale));
+    __STATIC_INLINE__ ggml_tensor* scale_modulate(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* scale) {
+        scale = ggml_reshape_3d(ctx->ggml_ctx, scale, scale->ne[0], 1, scale->ne[1]);
+        return ggml_ext_modulate(ctx, x, nullptr, scale);
     }
 
     __STATIC_INLINE__ ggml_tensor* gate_residual(ggml_context* ctx, ggml_tensor* residual, ggml_tensor* x, ggml_tensor* gate) {
@@ -186,7 +186,7 @@ namespace Boogu {
             auto scale_mlp = mods[2];
             auto gate_mlp  = mods[3];
 
-            x = scale_modulate(ctx->ggml_ctx, norm->forward(ctx, x), scale_msa);
+            x = scale_modulate(ctx, norm->forward(ctx, x), scale_msa);
             return {x, gate_msa, scale_mlp, gate_mlp};
         }
     };
@@ -231,7 +231,7 @@ namespace Boogu {
             auto linear_2 = std::dynamic_pointer_cast<Linear>(blocks["linear_2"]);
 
             auto emb = linear_1->forward(ctx, ggml_silu(ctx->ggml_ctx, conditioning_embedding));
-            x        = scale_modulate(ctx->ggml_ctx, norm->forward(ctx, x), emb);
+            x        = scale_modulate(ctx, norm->forward(ctx, x), emb);
             x        = linear_2->forward(ctx, x);
             return x;
         }
@@ -334,7 +334,7 @@ namespace Boogu {
                 auto attn_output = attn->forward(ctx, norm_hidden_states, norm_hidden_states, rotary_emb, attention_mask);
                 hidden_states    = gate_residual(ctx->ggml_ctx, hidden_states, norm2->forward(ctx, attn_output), gate_msa);
 
-                auto mlp_input  = scale_modulate(ctx->ggml_ctx, ffn_norm1->forward(ctx, hidden_states), scale_mlp);
+                auto mlp_input  = scale_modulate(ctx, ffn_norm1->forward(ctx, hidden_states), scale_mlp);
                 auto mlp_output = feed_forward->forward(ctx, mlp_input);
                 hidden_states   = gate_residual(ctx->ggml_ctx, hidden_states, ffn_norm2->forward(ctx, mlp_output), gate_mlp);
             } else {
@@ -512,14 +512,14 @@ namespace Boogu {
             img_hidden_states = gate_residual(ctx->ggml_ctx, img_hidden_states, img_attn_norm->forward(ctx, img_attn_out), img_gate_msa);
             img_hidden_states = gate_residual(ctx->ggml_ctx, img_hidden_states, img_self_attn_norm->forward(ctx, img_self_attn_out), img_gate_self);
 
-            auto img_mlp_input = scale_modulate(ctx->ggml_ctx, img_norm2_out, img_scale_mlp);
+            auto img_mlp_input = scale_modulate(ctx, img_norm2_out, img_scale_mlp);
             img_shift_mlp      = ggml_reshape_3d(ctx->ggml_ctx, img_shift_mlp, img_shift_mlp->ne[0], 1, img_shift_mlp->ne[1]);
             img_mlp_input      = ggml_add(ctx->ggml_ctx, img_mlp_input, img_shift_mlp);
             auto img_mlp_out   = img_feed_forward->forward(ctx, img_ffn_norm1->forward(ctx, img_mlp_input));
             img_hidden_states  = gate_residual(ctx->ggml_ctx, img_hidden_states, img_ffn_norm2->forward(ctx, img_mlp_out), img_gate_mlp);
 
             instruct_hidden_states  = gate_residual(ctx->ggml_ctx, instruct_hidden_states, instruct_attn_norm->forward(ctx, instruct_attn_out), instruct_gate_msa);
-            auto instruct_mlp_input = scale_modulate(ctx->ggml_ctx, instruct_norm2_out, instruct_scale_mlp);
+            auto instruct_mlp_input = scale_modulate(ctx, instruct_norm2_out, instruct_scale_mlp);
             instruct_shift_mlp      = ggml_reshape_3d(ctx->ggml_ctx, instruct_shift_mlp, instruct_shift_mlp->ne[0], 1, instruct_shift_mlp->ne[1]);
             instruct_mlp_input      = ggml_add(ctx->ggml_ctx, instruct_mlp_input, instruct_shift_mlp);
             auto instruct_mlp_out   = instruct_feed_forward->forward(ctx, instruct_ffn_norm1->forward(ctx, instruct_mlp_input));

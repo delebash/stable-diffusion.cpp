@@ -31,12 +31,12 @@ namespace Fibo2 {
                 }
                 auto key = name.substr(prefix.size() + 1);
                 if (key == "x_embedder.weight") {
-                    config.channels = tensor.ne[0];
+                    config.channels = tensor.logical_ne0();
                     config.dim      = tensor.ne[1];
                 } else if (key == "perceiver.latent_queries") {
                     config.max_gist = tensor.ne[1];
                 } else if (key == "perceiver.layers.0.cross_attention.to_k.weight" || key == "perceiver.layers.0.cross_attention.to_kv.weight") {
-                    config.text_dim = tensor.ne[0];
+                    config.text_dim = tensor.logical_ne0();
                     config.fused_kv = key == "perceiver.layers.0.cross_attention.to_kv.weight";
                 } else if (key == "layers.0.attention.norm_q.weight") {
                     config.head_dim = tensor.ne[0];
@@ -262,7 +262,7 @@ namespace Fibo2 {
                 }
                 return m;
             };
-            auto h = ZImage::modulate(c, norm("attention_norm1", x), select(0, false));
+            auto h = ZImage::modulate(ctx, norm("attention_norm1", x), select(0, false));
             h      = std::dynamic_pointer_cast<Attention>(blocks["attention"])->forward(ctx, h, h, pe);
             x      = ggml_add(c, x, ggml_mul(c, norm("attention_norm2", h), select(1, true)));
             if (injection) {
@@ -270,7 +270,7 @@ namespace Fibo2 {
                 h = ggml_mul(c, norm("cross_attn_norm2", h), ggml_tanh(c, params["cross_attn_gate"]));
                 x = ggml_add(c, x, h);
             }
-            h = ZImage::modulate(c, norm("ffn_norm1", x), select(2, false));
+            h = ZImage::modulate(ctx, norm("ffn_norm1", x), select(2, false));
             h = std::dynamic_pointer_cast<FeedForward>(blocks["feed_forward"])->forward(ctx, h);
             return ggml_add(c, x, ggml_mul(c, norm("ffn_norm2", h), select(3, true)));
         }

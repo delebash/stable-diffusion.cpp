@@ -27,12 +27,12 @@ namespace Flux3 {
                 std::string key = name.substr(prefix.size() + 1);
                 if (key == "txt_in.weight") {
                     detected           = true;
-                    config.context_dim = tensor.ne[0];
+                    config.context_dim = tensor.logical_ne0();
                     config.hidden_size = tensor.ne[1];
                 } else if (key == "emb_in.image.weight") {
-                    config.channels = tensor.ne[0];
+                    config.channels = tensor.logical_ne0();
                 } else if (key == "single_blocks.0.mlp_out.weight") {
-                    config.mlp_dim = tensor.ne[0];
+                    config.mlp_dim = tensor.logical_ne0();
                 } else if (key == "ref_time_in.in_layer.weight") {
                     config.flow_map = true;
                 }
@@ -83,7 +83,7 @@ namespace Flux3 {
             int64_t offset     = 0;
             for (size_t i = 0; i < lengths.size(); ++i) {
                 auto part = token_slice(gc, x, offset, lengths[i]);
-                part      = Flux::modulate(gc, ggml_norm(gc, part, 1e-6f), mods[i].shift, mods[i].scale);
+                part      = Flux::modulate(ctx, ggml_norm(gc, part, 1e-6f), mods[i].shift, mods[i].scale);
                 x_mod     = x_mod ? ggml_concat(gc, x_mod, part, 1) : part;
                 offset += lengths[i];
             }
