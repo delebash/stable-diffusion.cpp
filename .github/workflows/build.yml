@@ -7,54 +7,7 @@ on:
         description: "Create new release"
         required: true
         type: boolean
-  push:
-    branches:
-      - master
-      - ci
-    paths:
-      [
-        ".github/workflows/**",
-        ".dockerignore",
-        "docker/Dockerfile*",
-        "scripts/ci-cuda-cache.sh",
-        "**/CMakeLists.txt",
-        "**/Makefile",
-        "**/*.h",
-        "**/*.hpp",
-        "**/*.c",
-        "**/*.cpp",
-        "**/*.cu",
-        "**/*.cuh",
-        "ggml",
-        "examples/server/frontend",
-        "examples/server/frontend/**",
-        "examples/server/recipes/*.json",
-        "start-server.sh",
-        "start-server.bat",
-      ]
-  pull_request:
-    types: [opened, synchronize, reopened]
-    paths:
-      [
-        ".github/workflows/**",
-        ".dockerignore",
-        "docker/Dockerfile*",
-        "scripts/ci-cuda-cache.sh",
-        "**/CMakeLists.txt",
-        "**/Makefile",
-        "**/*.h",
-        "**/*.hpp",
-        "**/*.c",
-        "**/*.cpp",
-        "**/*.cu",
-        "**/*.cuh",
-        "ggml",
-        "examples/server/frontend",
-        "examples/server/frontend/**",
-        "examples/server/recipes/*.json",
-        "start-server.sh",
-        "start-server.bat",
-      ]
+  # jd fork: builds run only when started by hand — upstream's push and pull_request triggers are removed
 
 env:
   BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
