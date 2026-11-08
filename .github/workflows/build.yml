@@ -21,7 +21,9 @@ concurrency:
 
 jobs:
   ubuntu-latest-cmake:
-    runs-on: ubuntu-latest
+    # jd fork: built on Ubuntu 24.04 (the oldest supported LTS), so the binaries run there too — ubuntu-latest moved
+    # to 26.04, whose builds need glibc 2.43
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Clone
@@ -86,7 +88,8 @@ jobs:
             sd-${{ env.BRANCH_NAME }}-${{ steps.commit.outputs.short }}-bin-${{ steps.system-info.outputs.OS_TYPE }}-${{ steps.system-info.outputs.OS_NAME }}-${{ steps.system-info.outputs.OS_VERSION }}-${{ steps.system-info.outputs.CPU_ARCH }}.zip
 
   ubuntu-latest-cmake-vulkan:
-    runs-on: ubuntu-latest
+    # jd fork: Ubuntu 24.04, as above
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Clone
